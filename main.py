@@ -1,100 +1,104 @@
 import asyncio
 import cv2
-import websockets
 import os
-import signal
+import math
+import numpy as np
+from aiohttp import web
 
 # --- CONFIGURACIÓN ---
-# Detecta el puerto que nos da Azure o usa el 8081 por defecto
-PORT = int(os.environ.get("PORT", 8081))
+PORT = int(os.environ.get("PORT", 8000))
 VIDEO_PATH = "assets/bad_apple.mp4" 
-WIDTH = 100 
+WIDTH = 80 
 ASCII_CHARS = ["@", "#", "S", "%", "?", "*", "+", ";", ":", ",", "."]
 
-# --- VARIABLES GLOBALES ---
-ASCII_CACHE = [] 
-CURRENT_FRAME_INDEX = 0
-TOTAL_FRAMES = 0
+# --- HTML INTEGRADO ---
+HTML_CONTENT = """
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8"><title>BAD APPLE SERVER</title>
+    <style>
+        body { background: #000; color: #0f0; display: flex; flex-direction: column; justify-content: center; align-items: center; height: 100vh; margin: 0; font-family: monospace; overflow: hidden; }
+        #canvas { font-size: 10px; line-height: 8px; white-space: pre; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h1 id="status">CONECTANDO AL NÚCLEO...</h1>
+    <div id="canvas"></div>
+    <script>
+        const canvas = document.getElementById('canvas');
+        const status = document.getElementById('status');
+        const wsUrl = (window.location.protocol === 'https:' ? 'wss://' : 'ws://') + window.location.host + '/ws';
+        let socket;
+        function connect() {
+            socket = new WebSocket(wsUrl);
+            socket.onopen = () => { status.innerText = "SISTEMA ONLINE"; status.style.color = "#fff"; };
+            socket.onmessage = (e) => { canvas.innerText = e.data; };
+            socket.onclose = () => { status.innerText = "RECONECTANDO..."; setTimeout(connect, 1000); };
+        }
+        connect();
+    </script>
+</body>
+</html>
+"""
 
-def resize_image(image, new_width=100):
-    (h, w) = image.shape
-    aspect_ratio = h / w
-    new_height = int(aspect_ratio * new_width * 0.55)
-    resized_image = cv2.resize(image, (new_width, new_height))
-    return resized_image
-
-def pixel_to_ascii(image):
-    pixels = image.flatten()
-    ascii_str = "".join([ASCII_CHARS[pixel // 25] for pixel in pixels])
-    return ascii_str
-
-def load_video_to_memory():
-    global ASCII_CACHE, TOTAL_FRAMES
-    
-    if not os.path.exists(VIDEO_PATH):
-        print(f"❌ ERROR CRITICO: No encuentro {VIDEO_PATH}")
-        return
-
-    print("⏳ CARGANDO VIDEO EN MEMORIA RAM...")
-    cap = cv2.VideoCapture(VIDEO_PATH)
-    
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-            
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        resized_frame = resize_image(gray_frame, WIDTH)
-        ascii_str = pixel_to_ascii(resized_frame)
-        img_width = resized_frame.shape[1]
-        ascii_img = "\n".join([ascii_str[i:(i+img_width)] for i in range(0, len(ascii_str), img_width)])
+class BadAppleEngine:
+    def __init__(self):
+        self.frames = []
+        self.use_math = True
         
-        ASCII_CACHE.append(ascii_img)
+    def load(self):
+        print(f"🔍 Buscando video en: {os.path.abspath(VIDEO_PATH)}")
+        if os.path.exists(VIDEO_PATH):
+            cap = cv2.VideoCapture(VIDEO_PATH)
+            if cap.isOpened():
+                print("✅ Video abierto. Procesando frames...")
+                while len(self.frames) < 500: # Limitamos a 500 frames para no explotar la RAM de Azure
+                    ret, frame = cap.read()
+                    if not ret: break
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    resized = cv2.resize(gray, (WIDTH, int(WIDTH * 0.5)))
+                    ascii_f = "".join([ASCII_CHARS[p // 25] for p in resized.flatten()])
+                    self.frames.append("\\n".join([ascii_f[i:i+WIDTH] for i in range(0, len(ascii_f), WIDTH)]))
+                cap.release()
+                if self.frames:
+                    self.use_math = False
+                    print(f"🎬 {len(self.frames)} frames cargados.")
+                    return
+        print("⚠️ Falla de video. Activando generador matemático.")
 
-    cap.release()
-    TOTAL_FRAMES = len(ASCII_CACHE)
-    print(f"✅ VIDEO CARGADO: {TOTAL_FRAMES} frames listos en RAM.")
+    def get_frame(self, t):
+        if not self.use_math:
+            return self.frames[t % len(self.frames)]
+        # Generador de emergencia (Metaballs ASCII)
+        out = ""
+        for y in range(30):
+            for x in range(WIDTH):
+                d = math.sqrt((x-WIDTH/2 + math.sin(t/10)*20)**2 + (y-15 + math.cos(t/10)*10)**2)
+                out += ASCII_CHARS[min(int(100/max(d,1)), 10)]
+            out += "\\n"
+        return out
 
-async def global_video_clock():
-    global CURRENT_FRAME_INDEX
-    print("⏰ RELOJ GLOBAL INICIADO")
-    while True:
-        if TOTAL_FRAMES > 0:
-            CURRENT_FRAME_INDEX = (CURRENT_FRAME_INDEX + 1) % TOTAL_FRAMES
-        await asyncio.sleep(0.033) # 30 FPS
+engine = BadAppleEngine()
 
-async def handler(websocket):
-    print(f"🔥 CLIENTE CONECTADO desde {websocket.remote_address}")
+async def websocket_handler(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    t = 0
     try:
-        while True:
-            if TOTAL_FRAMES > 0:
-                await websocket.send(ASCII_CACHE[CURRENT_FRAME_INDEX])
-            await asyncio.sleep(0.033)
-            
-    except websockets.exceptions.ConnectionClosed:
-        print("⚠️ Cliente desconectado")
-    except Exception as e:
-        print(f"❌ Error en socket: {e}")
+        while not ws.closed:
+            await ws.send_str(engine.get_frame(t))
+            t += 1
+            await asyncio.sleep(0.04)
+    finally:
+        return ws
 
-async def main():
-    print("--- INICIANDO SERVIDOR BAD APPLE ---")
-    load_video_to_memory()
-    
-    if TOTAL_FRAMES == 0:
-        print("❌ DETENIENDO: El video está vacío o no se cargó.")
-        return
+async def index(request):
+    return web.Response(text=HTML_CONTENT, content_type='text/html')
 
-    asyncio.create_task(global_video_clock())
+app = web.Application()
+app.add_routes([web.get('/', index), web.get('/ws', websocket_handler)])
 
-    # AQUÍ ESTÁ LA CLAVE: 0.0.0.0 permite que Azure entre
-    print(f"🚀 SERVIDOR ESCUCHANDO EN 0.0.0.0:{PORT}")
-    async with websockets.serve(handler, "0.0.0.0", PORT, ping_interval=None):
-        # Mantenemos el proceso vivo para siempre
-        stop = asyncio.Future()
-        await stop
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n🛑 Servidor detenido manualmente.")
+if __name__ == '__main__':
+    engine.load()
+    web.run_app(app, port=PORT)
