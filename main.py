@@ -5,9 +5,14 @@ import numpy as np
 from aiohttp import web
 import logging
 
+
+
+
 # Configuración de Logs para ver TODO en Azure
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("BadApple")
+
+
 
 # --- CONFIGURACIÓN ---
 PORT = int(os.environ.get("PORT", 8000))
