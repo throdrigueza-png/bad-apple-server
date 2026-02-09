@@ -9,6 +9,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("BadApple")
 
 # --- CONFIGURACIÓN DE ENTORNO ---
+# Azure siempre pasa el puerto en la variable de entorno PORT
 PORT = int(os.environ.get("PORT", 8000))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VIDEO_PATH = os.path.join(BASE_DIR, "assets", "bad_apple.mp4")
@@ -23,7 +24,7 @@ class VideoEngine:
         self.error = None
 
     async def preload_async(self):
-        """Carga el video en memoria COMPLETO"""
+        """Carga el video en memoria COMPLETO en segundo plano"""
         logger.info(f"--> Buscando video en: {VIDEO_PATH}")
         
         if not os.path.exists(VIDEO_PATH):
@@ -37,9 +38,6 @@ class VideoEngine:
         try:
             while True:
                 ret, frame = cap.read()
-                
-                # --- CAMBIO IMPORTANTE AQUÍ ---
-                # Quitamos el límite de 2500. Ahora solo para si se acaba el video.
                 if not ret: 
                     break 
                 
@@ -60,12 +58,12 @@ class VideoEngine:
                 self.frames.append(ascii_frame)
                 count += 1
                 
-                # Dejamos respirar al servidor cada 100 cuadros
-                if count % 100 == 0:
+                # Dejamos respirar al servidor cada 50 cuadros para no bloquear el inicio
+                if count % 50 == 0:
                     await asyncio.sleep(0.01) 
             
             self.is_ready = True
-            logger.info(f"--> VIDEO COMPLETADO: {len(self.frames)} cuadros cargados.")
+            logger.info(f"--> VIDEO COMPLETADO: {len(self.frames)} cuadros cargados en RAM.")
             
         except Exception as e:
             logger.error(f"Error procesando video: {e}")
@@ -74,7 +72,7 @@ class VideoEngine:
 
 engine = VideoEngine()
 
-# --- FRONTEND ---
+# --- FRONTEND (HTML) ---
 HTML_CONTENT = """
 <!DOCTYPE html>
 <html lang="es">
@@ -102,10 +100,13 @@ HTML_CONTENT = """
 
         function connect() {
             const proto = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
-            socket = new WebSocket(proto + window.location.host + '/ws');
+            const wsUrl = proto + window.location.host + '/ws';
+            console.log("Conectando a: " + wsUrl);
+            
+            socket = new WebSocket(wsUrl);
             
             socket.onopen = () => {
-                status.innerText = "● BAD APPLE - FULL VERSION";
+                status.innerText = "● BAD APPLE - ONLINE";
                 status.className = "live";
             };
             
@@ -116,7 +117,7 @@ HTML_CONTENT = """
             socket.onclose = () => {
                 status.innerText = "○ RECONECTANDO...";
                 status.className = "error";
-                setTimeout(connect, 1000);
+                setTimeout(connect, 2000);
             };
             
             socket.onerror = (e) => console.error("WS Error:", e);
@@ -134,26 +135,37 @@ async def ws_handler(request):
     ws = web.WebSocketResponse(autoping=True, heartbeat=10.0)
     await ws.prepare(request)
     
+    # Esperar a que el video cargue si el usuario entra muy rápido
     if not engine.is_ready:
-        await ws.send_str("CARGANDO VIDEO COMPLETO...\nESTO TARDARÁ UNOS SEGUNDOS...")
+        await ws.send_str("CARGANDO VIDEO EN EL SERVIDOR...\nESPERA UN MOMENTO...")
         while not engine.is_ready:
             await asyncio.sleep(1)
 
     try:
         i = 0
         total_frames = len(engine.frames)
+        if total_frames == 0:
+             await ws.send_str("ERROR: VIDEO NO ENCONTRADO O VACÍO")
+             return ws
+
+        # Bucle de streaming
         while not ws.closed:
             await ws.send_str(engine.frames[i])
             i = (i + 1) % total_frames
             await asyncio.sleep(0.033) # ~30 FPS
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error en socket: {e}")
+    finally:
         pass
+        
     return ws
 
 async def start_background_tasks(app):
+    """Inicia la carga del video sin bloquear el servidor"""
     app['video_loader'] = asyncio.create_task(engine.preload_async())
 
-async def init_app():
+# --- INICIO DE LA APP ---
+def init_app():
     app = web.Application()
     app.router.add_get('/', index_handler)
     app.router.add_get('/ws', ws_handler)
@@ -161,4 +173,6 @@ async def init_app():
     return app
 
 if __name__ == '__main__':
-    web.run_app(init_app(), host='0.0.0.0', port=PORT)
+    # Ejecución directa para Azure
+    app = init_app()
+    web.run_app(app, host='0.0.0.0', port=PORT)
