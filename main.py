@@ -9,31 +9,29 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("BadApple")
 
 # --- CONFIGURACIÓN DE ENTORNO ---
-# Azure siempre pasa el puerto en la variable de entorno PORT
 PORT = int(os.environ.get("PORT", 8000))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VIDEO_PATH = os.path.join(BASE_DIR, "assets", "bad_apple.mp4")
 
 ASCII_CHARS = ["@", "#", "S", "%", "?", "*", "+", ";", ":", ",", "."]
-WIDTH = 80 
+# Reducimos un poco el ancho para que Azure no se ahogue
+WIDTH = 60 
 
 class VideoEngine:
     def __init__(self):
         self.frames = []
         self.is_ready = False
-        self.error = None
+        self.total_frames_loaded = 0
 
     async def preload_async(self):
-        """Carga el video en memoria COMPLETO en segundo plano"""
-        logger.info(f"--> Buscando video en: {VIDEO_PATH}")
+        """Carga el video cediendo el control en CADA cuadro para no bloquear"""
+        logger.info(f"--> Iniciando carga suave de: {VIDEO_PATH}")
         
         if not os.path.exists(VIDEO_PATH):
-            self.error = "ERROR CRÍTICO: No existe assets/bad_apple.mp4"
-            logger.error(self.error)
+            logger.error("ERROR CRÍTICO: No existe el video")
             return
 
         cap = cv2.VideoCapture(VIDEO_PATH)
-        count = 0
         
         try:
             while True:
@@ -41,57 +39,55 @@ class VideoEngine:
                 if not ret: 
                     break 
                 
-                # 1. Escala de grises
+                # Procesamiento rápido
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                
-                # 2. Redimensionar
                 h, w = gray.shape
                 aspect_ratio = w / h
                 new_height = int(WIDTH / aspect_ratio * 0.55)
                 resized = cv2.resize(gray, (WIDTH, new_height))
                 
-                # 3. ASCII
                 ascii_frame = ""
                 for row in resized:
                     ascii_frame += "".join([ASCII_CHARS[pixel // 25] for pixel in row]) + "\n"
                 
                 self.frames.append(ascii_frame)
-                count += 1
+                self.total_frames_loaded += 1
                 
-                # Dejamos respirar al servidor cada 50 cuadros para no bloquear el inicio
-                if count % 50 == 0:
-                    await asyncio.sleep(0.01) 
+                # --- EL CAMBIO MÁGICO ---
+                # Dormir 0 segundos fuerza a Python a soltar la CPU y 
+                # atender el WebSocket. Vital para que no se corte.
+                await asyncio.sleep(0) 
             
             self.is_ready = True
-            logger.info(f"--> VIDEO COMPLETADO: {len(self.frames)} cuadros cargados en RAM.")
+            logger.info(f"--> CARGA COMPLETA: {len(self.frames)} cuadros.")
             
         except Exception as e:
-            logger.error(f"Error procesando video: {e}")
+            logger.error(f"Error cargando video: {e}")
         finally:
             cap.release()
 
 engine = VideoEngine()
 
-# --- FRONTEND (HTML) ---
+# --- FRONTEND ---
 HTML_CONTENT = """
 <!DOCTYPE html>
 <html lang="es">
 <head>
     <meta charset="UTF-8">
-    <title>BAD APPLE FULL</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BAD APPLE</title>
     <style>
         body { background: #000; color: #0f0; font-family: 'Courier New', monospace; 
                display: flex; flex-direction: column; align-items: center; justify-content: center; 
                height: 100vh; margin: 0; overflow: hidden; }
-        #screen { font-size: 10px; line-height: 8px; white-space: pre; border: 1px solid #050; padding: 20px; }
-        #status { font-size: 1.2rem; margin-bottom: 10px; font-weight: bold; }
-        .live { color: #0f0; text-shadow: 0 0 10px #0f0; }
+        #screen { font-size: 8px; line-height: 8px; white-space: pre; border: 1px solid #050; padding: 10px; }
+        #status { font-size: 1rem; margin-bottom: 10px; font-weight: bold; text-align: center; }
+        .live { color: #0f0; text-shadow: 0 0 5px #0f0; }
         .error { color: #f00; }
-        .loading { color: #ff0; }
     </style>
 </head>
 <body>
-    <div id="status" class="loading">CONECTANDO...</div>
+    <div id="status">CONECTANDO...</div>
     <div id="screen"></div>
     <script>
         const screen = document.getElementById('screen');
@@ -100,13 +96,13 @@ HTML_CONTENT = """
 
         function connect() {
             const proto = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
-            const wsUrl = proto + window.location.host + '/ws';
-            console.log("Conectando a: " + wsUrl);
+            // Añadimos timestamp para evitar caché agresivo
+            const wsUrl = proto + window.location.host + '/ws?t=' + Date.now();
             
             socket = new WebSocket(wsUrl);
             
             socket.onopen = () => {
-                status.innerText = "● BAD APPLE - ONLINE";
+                status.innerText = "● LIVE";
                 status.className = "live";
             };
             
@@ -114,10 +110,12 @@ HTML_CONTENT = """
                 screen.innerText = e.data; 
             };
             
-            socket.onclose = () => {
-                status.innerText = "○ RECONECTANDO...";
+            socket.onclose = (e) => {
+                console.log("Cerrado: ", e);
+                status.innerText = "RECONECTANDO...";
                 status.className = "error";
-                setTimeout(connect, 2000);
+                // Reconexión agresiva rápida
+                setTimeout(connect, 500);
             };
             
             socket.onerror = (e) => console.error("WS Error:", e);
@@ -132,39 +130,46 @@ async def index_handler(request):
     return web.Response(text=HTML_CONTENT, content_type='text/html')
 
 async def ws_handler(request):
-    ws = web.WebSocketResponse(autoping=True, heartbeat=10.0)
+    # Heartbeat a 30s para ser más tolerantes con lags de red
+    ws = web.WebSocketResponse(autoping=True, heartbeat=30.0)
     await ws.prepare(request)
     
-    # Esperar a que el video cargue si el usuario entra muy rápido
-    if not engine.is_ready:
-        await ws.send_str("CARGANDO VIDEO EN EL SERVIDOR...\nESPERA UN MOMENTO...")
-        while not engine.is_ready:
-            await asyncio.sleep(1)
+    # Si el motor apenas está arrancando, esperamos un poco
+    while len(engine.frames) < 100 and not engine.is_ready:
+        await ws.send_str(f"BUFFERING... {len(engine.frames)} FRAMES")
+        await asyncio.sleep(0.5)
 
     try:
         i = 0
         total_frames = len(engine.frames)
-        if total_frames == 0:
-             await ws.send_str("ERROR: VIDEO NO ENCONTRADO O VACÍO")
-             return ws
-
+        
         # Bucle de streaming
         while not ws.closed:
+            # Si alcanzamos el final de lo que hay cargado, esperamos
+            if i >= len(engine.frames):
+                if engine.is_ready:
+                    i = 0 # Reiniciar video si ya terminó de cargar todo
+                else:
+                    await asyncio.sleep(0.1) # Esperar a que cargue más
+                    continue
+            
+            # Enviar cuadro
             await ws.send_str(engine.frames[i])
-            i = (i + 1) % total_frames
-            await asyncio.sleep(0.033) # ~30 FPS
+            i += 1
+            
+            # Control de FPS (30 FPS = ~0.033s)
+            await asyncio.sleep(0.033)
+            
     except Exception as e:
-        logger.error(f"Error en socket: {e}")
+        logger.error(f"Cliente desconectado: {e}")
     finally:
         pass
         
     return ws
 
 async def start_background_tasks(app):
-    """Inicia la carga del video sin bloquear el servidor"""
     app['video_loader'] = asyncio.create_task(engine.preload_async())
 
-# --- INICIO DE LA APP ---
 def init_app():
     app = web.Application()
     app.router.add_get('/', index_handler)
@@ -173,6 +178,5 @@ def init_app():
     return app
 
 if __name__ == '__main__':
-    # Ejecución directa para Azure
     app = init_app()
     web.run_app(app, host='0.0.0.0', port=PORT)
