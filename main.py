@@ -13,7 +13,6 @@ PORT = int(os.environ.get("PORT", 8000))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VIDEO_PATH = os.path.join(BASE_DIR, "assets", "bad_apple.mp4")
 
-# Caracteres para el arte ASCII
 ASCII_CHARS = ["@", "#", "S", "%", "?", "*", "+", ";", ":", ",", "."]
 WIDTH = 80 
 
@@ -24,7 +23,7 @@ class VideoEngine:
         self.error = None
 
     async def preload_async(self):
-        """Carga el video en memoria sin bloquear el servidor"""
+        """Carga el video en memoria COMPLETO"""
         logger.info(f"--> Buscando video en: {VIDEO_PATH}")
         
         if not os.path.exists(VIDEO_PATH):
@@ -38,20 +37,22 @@ class VideoEngine:
         try:
             while True:
                 ret, frame = cap.read()
-                # Limite de seguridad (aprox 1.5 min de video para no explotar la RAM)
-                if not ret or count >= 2500: 
+                
+                # --- CAMBIO IMPORTANTE AQUÍ ---
+                # Quitamos el límite de 2500. Ahora solo para si se acaba el video.
+                if not ret: 
                     break 
                 
                 # 1. Escala de grises
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 
-                # 2. Redimensionar manteniendo ratio
+                # 2. Redimensionar
                 h, w = gray.shape
                 aspect_ratio = w / h
-                new_height = int(WIDTH / aspect_ratio * 0.55) # 0.55 corrige la altura de la fuente
+                new_height = int(WIDTH / aspect_ratio * 0.55)
                 resized = cv2.resize(gray, (WIDTH, new_height))
                 
-                # 3. Convertir a ASCII
+                # 3. ASCII
                 ascii_frame = ""
                 for row in resized:
                     ascii_frame += "".join([ASCII_CHARS[pixel // 25] for pixel in row]) + "\n"
@@ -59,28 +60,27 @@ class VideoEngine:
                 self.frames.append(ascii_frame)
                 count += 1
                 
-                # IMPORTANTE: Cede el control cada 50 frames para que el servidor arranque
-                if count % 50 == 0:
+                # Dejamos respirar al servidor cada 100 cuadros
+                if count % 100 == 0:
                     await asyncio.sleep(0.01) 
             
             self.is_ready = True
-            logger.info(f"--> VIDEO CARGADO EXITOSAMENTE: {len(self.frames)} cuadros en memoria.")
+            logger.info(f"--> VIDEO COMPLETADO: {len(self.frames)} cuadros cargados.")
             
         except Exception as e:
             logger.error(f"Error procesando video: {e}")
         finally:
             cap.release()
 
-# Instancia global del motor
 engine = VideoEngine()
 
-# --- HTML / FRONTEND ---
+# --- FRONTEND ---
 HTML_CONTENT = """
 <!DOCTYPE html>
 <html lang="es">
 <head>
     <meta charset="UTF-8">
-    <title>BAD APPLE AZURE</title>
+    <title>BAD APPLE FULL</title>
     <style>
         body { background: #000; color: #0f0; font-family: 'Courier New', monospace; 
                display: flex; flex-direction: column; align-items: center; justify-content: center; 
@@ -105,7 +105,7 @@ HTML_CONTENT = """
             socket = new WebSocket(proto + window.location.host + '/ws');
             
             socket.onopen = () => {
-                status.innerText = "● EN VIVO";
+                status.innerText = "● BAD APPLE - FULL VERSION";
                 status.className = "live";
             };
             
@@ -127,67 +127,38 @@ HTML_CONTENT = """
 </html>
 """
 
-# --- HANDLERS (RUTAS) ---
-
 async def index_handler(request):
-    """Sirve la página HTML"""
     return web.Response(text=HTML_CONTENT, content_type='text/html')
 
 async def ws_handler(request):
-    """Maneja la conexión WebSocket con Heartbeat"""
-    
-    # AQUÍ ESTÁ LA MAGIA: heartbeat=10.0 evita que Azure corte la conexión
     ws = web.WebSocketResponse(autoping=True, heartbeat=10.0)
     await ws.prepare(request)
     
-    logger.info("NUEVO CLIENTE CONECTADO")
-
-    # Si el video aun no carga, esperamos sin bloquear
     if not engine.is_ready:
-        await ws.send_str("CARGANDO VIDEO EN EL SERVIDOR...\nESPERA UN MOMENTO...")
+        await ws.send_str("CARGANDO VIDEO COMPLETO...\nESTO TARDARÁ UNOS SEGUNDOS...")
         while not engine.is_ready:
             await asyncio.sleep(1)
 
     try:
-        # Bucle de reproducción
         i = 0
         total_frames = len(engine.frames)
-        
         while not ws.closed:
-            # Enviamos el cuadro actual
             await ws.send_str(engine.frames[i])
-            
-            # Avanzamos al siguiente cuadro (bucle infinito con módulo %)
             i = (i + 1) % total_frames
-            
-            # CONTROL DE VELOCIDAD (FPS)
-            # 0.033 = ~30 FPS
-            # IMPORTANTE: Usar await asyncio.sleep, NUNCA time.sleep
-            await asyncio.sleep(0.033)
-
-    except Exception as e:
-        logger.info(f"Cliente desconectado o error: {e}")
-    finally:
-        logger.info("Conexión cerrada.")
-    
+            await asyncio.sleep(0.033) # ~30 FPS
+    except Exception:
+        pass
     return ws
 
-# --- INICIO DE LA APP ---
-
 async def start_background_tasks(app):
-    """Inicia la carga del video cuando la app arranca"""
     app['video_loader'] = asyncio.create_task(engine.preload_async())
 
 async def init_app():
-    """Factoría de la aplicación"""
     app = web.Application()
     app.router.add_get('/', index_handler)
     app.router.add_get('/ws', ws_handler)
-    
-    # Registramos la tarea de carga al inicio
     app.on_startup.append(start_background_tasks)
     return app
 
 if __name__ == '__main__':
-    # Ejecución directa
     web.run_app(init_app(), host='0.0.0.0', port=PORT)
